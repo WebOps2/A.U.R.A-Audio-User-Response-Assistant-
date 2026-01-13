@@ -7,6 +7,7 @@ import { summarize } from '../summarize/index.js';
 import { speak } from '../tts/elevenlabs.js';
 import { createMemory, updateMemory, explainFailure, getDetails } from '../session/memory.js';
 import { Intent } from '../intents/types.js';
+import { planAndExplain } from '../agent/agent.js';
 import { existsSync } from 'fs';
 
 /**
@@ -25,7 +26,7 @@ async function safeSpeak(text: string, mute: boolean): Promise<void> {
 /**
  * Multi-turn chat mode: interactive loop with session memory.
  */
-export async function chatMode(repoPath: string, mute: boolean): Promise<void> {
+export async function chatMode(repoPath: string, mute: boolean, useAgent: boolean = false): Promise<void> {
   console.log('🎤 DevVoice - Chat Mode');
   console.log(`📁 Repository: ${repoPath}`);
   console.log('💬 Say "exit" to quit\n');
@@ -53,28 +54,65 @@ export async function chatMode(repoPath: string, mute: boolean): Promise<void> {
       const transcription = await transcribe(audioPath);
       console.log(`\n💬 Heard: "${transcription}"`);
       
-      // Step 4: Route intent
-      const intentResult = routeIntent(transcription);
-      const plan = createPlan(intentResult);
+      // Step 4: Plan using AI agent or fallback router
+      let intent: Intent;
+      let params: Record<string, string> | undefined;
+      let planDescription: string;
+      let requiresConfirmation = false;
       
-      console.log(`\n📋 Plan: ${plan.description}`);
+      if (useAgent && process.env.OPENAI_API_KEY) {
+        console.log('🤖 Using AI agent for planning...');
+        const agentResult = await planAndExplain(transcription, memory);
+        
+        // Handle low confidence with clarifying question
+        if (agentResult.confidence < 0.6 && agentResult.clarifyingQuestion) {
+          const questionText = `I'm not sure I understood. ${agentResult.clarifyingQuestion}`;
+          console.log(`\n❓ ${questionText}`);
+          await safeSpeak(questionText, mute);
+          continue;
+        }
+        
+        intent = agentResult.intent;
+        params = agentResult.params;
+        planDescription = agentResult.planSteps.join(' → ');
+        
+        // Map intent to confirmation requirement
+        requiresConfirmation = intent === Intent.CREATE_BRANCH || intent === Intent.MAKE_COMMIT;
+        
+        // Use AI explanation for EXPLAIN_FAILURE if available
+        if (agentResult.explanation && intent === Intent.EXPLAIN_FAILURE) {
+          console.log(`\n💡 Explanation: ${agentResult.explanation}`);
+          await safeSpeak(agentResult.explanation, mute);
+          continue;
+        }
+      } else {
+        // Fallback to simple router
+        const intentResult = routeIntent(transcription);
+        const plan = createPlan(intentResult);
+        intent = plan.intent;
+        params = plan.params;
+        planDescription = plan.description;
+        requiresConfirmation = plan.requiresConfirmation;
+      }
+      
+      console.log(`\n📋 Plan: ${planDescription}`);
       
       // Handle special intents
-      if (plan.intent === Intent.EXIT) {
+      if (intent === Intent.EXIT) {
         const goodbyeText = 'Goodbye!';
         console.log(goodbyeText);
         await safeSpeak(goodbyeText, mute);
         break;
       }
       
-      if (plan.intent === Intent.HELP) {
+      if (intent === Intent.HELP) {
         const helpText = getHelpText();
         console.log(helpText);
         await safeSpeak(helpText, mute);
         continue;
       }
       
-      if (plan.intent === Intent.REPEAT_LAST) {
+      if (intent === Intent.REPEAT_LAST) {
         if (memory.lastSummary) {
           console.log(`\n📊 Repeating: ${memory.lastSummary}`);
           await safeSpeak(memory.lastSummary, mute);
@@ -86,14 +124,16 @@ export async function chatMode(repoPath: string, mute: boolean): Promise<void> {
         continue;
       }
       
-      if (plan.intent === Intent.EXPLAIN_FAILURE) {
+      if (intent === Intent.EXPLAIN_FAILURE) {
+        // If agent provided explanation, it was already handled above
+        // Otherwise use fallback explanation
         const explanation = explainFailure(memory);
         console.log(`\n📊 Explanation: ${explanation}`);
         await safeSpeak(explanation, mute);
         continue;
       }
       
-      if (plan.intent === Intent.DETAILS) {
+      if (intent === Intent.DETAILS) {
         const details = getDetails(memory);
         console.log(`\n📄 Details:\n${details}`);
         // Summarize details for speech (first 200 chars)
@@ -102,7 +142,7 @@ export async function chatMode(repoPath: string, mute: boolean): Promise<void> {
         continue;
       }
       
-      if (plan.intent === Intent.UNKNOWN) {
+      if (intent === Intent.UNKNOWN) {
         const unknownText = `I didn't understand that. Try saying "help" for available commands.`;
         console.log(unknownText);
         await safeSpeak(unknownText, mute);
@@ -110,14 +150,14 @@ export async function chatMode(repoPath: string, mute: boolean): Promise<void> {
       }
       
       // Step 5: Get command
-      const commandTemplate = await getCommandForIntent(plan.intent, plan.params, repoPath);
+      const commandTemplate = await getCommandForIntent(intent, params, repoPath);
       
       if (!commandTemplate) {
         let errorText: string;
-        if (plan.intent === Intent.MAKE_COMMIT) {
+        if (intent === Intent.MAKE_COMMIT) {
           errorText = 'Cannot commit: no staged changes. Please stage files first using git add.';
         } else {
-          errorText = `Cannot execute ${plan.intent}. Command not available or parameters missing.`;
+          errorText = `Cannot execute ${intent}. Command not available or parameters missing.`;
         }
         console.log(`❌ ${errorText}`);
         await safeSpeak(errorText, mute);
@@ -125,7 +165,7 @@ export async function chatMode(repoPath: string, mute: boolean): Promise<void> {
       }
       
       // Step 6: Confirm if needed
-      if (plan.requiresConfirmation) {
+      if (requiresConfirmation) {
         console.log('\n⚠️  This action requires confirmation.');
         await waitForPushToTalk();
         console.log('🔴 Recording confirmation...');
@@ -147,8 +187,8 @@ export async function chatMode(repoPath: string, mute: boolean): Promise<void> {
       const result = await executeCommand(commandTemplate);
       
       // Step 8: Update memory
-      const summary = summarize(plan.intent, result);
-      updateMemory(memory, plan.intent, result, summary);
+      const summary = summarize(intent, result);
+      updateMemory(memory, intent, result, summary);
       
       // Step 9: Summarize and speak
       console.log(`\n📊 Summary: ${summary}`);

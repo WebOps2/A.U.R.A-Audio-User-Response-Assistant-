@@ -1,13 +1,8 @@
+import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
-import { createWriteStream } from 'fs';
-import * as recorder from "node-record-lpcm16";
+import { mkdir } from 'fs/promises';
 import { tmpdir } from 'os';
-import { join } from 'path';
-// WAV package uses CommonJS, so we need to use createRequire for ES modules
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const wav = require('wav');
-const { Writer } = wav;
+import { dirname, join } from 'path';
 
 export interface RecordingOptions {
   durationSeconds?: number;
@@ -15,64 +10,143 @@ export interface RecordingOptions {
 }
 
 /**
- * Records audio from the microphone for a specified duration.
+ * Records audio from the microphone using FFmpeg.
  * Returns the path to the saved WAV file.
  */
 export async function recordAudio(options: RecordingOptions = {}): Promise<string> {
   const durationSeconds = options.durationSeconds || 8;
   const sampleRate = options.sampleRate || 16000;
   
-  const outputPath = join(tmpdir(), `devvoice-${randomUUID()}.wav`);
+  // Ensure tmp directory exists
+  const tmpDir = tmpdir();
+  const outputPath = join(tmpDir, `devvoice-${randomUUID()}.wav`);
+  
+  // Ensure output directory exists
+  await mkdir(dirname(outputPath), { recursive: true });
   
   return new Promise((resolve, reject) => {
-    const writer = new Writer({
-      sampleRate,
-      channels: 1,
-      bitDepth: 16,
-    });
-    
-    const fileStream = createWriteStream(outputPath);
-    writer.pipe(fileStream);
-    
-    const recording = recorder.record({
-      sampleRateHertz: sampleRate,
-      threshold: 0,
-      verbose: false,
-      recordProgram: process.platform === 'win32' ? 'sox' : 'rec',
-      silence: '0.0',
-    });
-
-    recording.stream().pipe(writer);
-
     // Track if promise is already settled to prevent double resolution
     let settled = false;
-
-    // Attach close listener immediately (before error handler) to handle early errors
-    fileStream.on('close', () => {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    
+    // Build FFmpeg arguments
+    const args: string[] = [];
+    
+    if (process.platform === 'win32') {
+      // Windows: Use DirectShow
+      // Allow microphone name to be overridden via env var
+      const micName = process.env.DEVVOICE_MIC || 
+        'Microphone Array (Intel® Smart Sound Technology for Digital Microphones)';
+      
+      args.push(
+        '-hide_banner',                // Reduce noise
+        '-loglevel', 'error',          // Only show errors
+        '-f', 'dshow',
+        '-i', `audio=${micName}`,
+        '-t', durationSeconds.toString(), // Duration (primary control)
+        '-ac', '1',                    // Mono
+        '-ar', sampleRate.toString(),   // Sample rate
+        '-acodec', 'pcm_s16le',        // 16-bit PCM
+        '-y',                          // Overwrite output file
+        outputPath
+      );
+    } else {
+      // Linux/macOS: Use alsa/pulseaudio
+      args.push(
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-f', 'alsa',                  // or 'pulse' for PulseAudio
+        '-i', 'default',
+        '-t', durationSeconds.toString(),
+        '-ac', '1',
+        '-ar', sampleRate.toString(),
+        '-acodec', 'pcm_s16le',
+        '-y',
+        outputPath
+      );
+    }
+    
+    // Spawn FFmpeg process
+    const ffmpeg = spawn('ffmpeg', args, {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'], // stdin ignored, stdout/stderr piped
+    });
+    
+    let stderrOutput = '';
+    
+    // Collect stderr (FFmpeg outputs info to stderr)
+    ffmpeg.stderr?.on('data', (data: Buffer) => {
+      stderrOutput += data.toString();
+    });
+    
+    // Handle process errors (e.g., ffmpeg not found) - spawn failures
+    ffmpeg.on('error', (err: Error) => {
       if (!settled) {
         settled = true;
-        resolve(outputPath);
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = null;
+        }
+        
+        let errorMsg = 'Failed to start audio recording. ';
+        
+        if (err.message && (err.message.includes('ENOENT') || err.message.includes('spawn'))) {
+          errorMsg += 'FFmpeg not found. Please install FFmpeg and ensure it is in your PATH.';
+        } else {
+          errorMsg += err.message;
+        }
+        
+        reject(new Error(errorMsg));
       }
     });
-
-    // Error handler - reject immediately and clean up
-    recording.stream().on('error', (err: Error) => {
+    
+    // PRIMARY: Handle process exit - this is the main resolution mechanism
+    ffmpeg.on('close', (code: number) => {
+      // Clear safety timeout when process exits
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
+      
       if (!settled) {
         settled = true;
-        recording.stop();
-        writer.end();
-        reject(err);
+        if (code === 0) {
+          // Success - FFmpeg completed normally
+          resolve(outputPath);
+        } else {
+          // FFmpeg failed with non-zero exit code
+          const errorMsg = `FFmpeg recording failed with exit code ${code}. ` +
+            (stderrOutput ? `Error: ${stderrOutput.slice(-500)}` : 'No error details available.');
+          reject(new Error(errorMsg));
+        }
       }
     });
-
-    // Stop recording after duration
-    setTimeout(() => {
+    
+    // SAFETY: Timeout as backup (should not normally fire since -t controls duration)
+    // Set to duration + 2 seconds buffer to allow FFmpeg to finish
+    timeoutHandle = setTimeout(() => {
       if (!settled) {
-        recording.stop();
-        writer.end();
-        // Close listener will handle resolution
+        settled = true;
+        // Try to kill gracefully first, then force kill
+        try {
+          ffmpeg.kill('SIGTERM');
+          // Give it 500ms to exit gracefully
+          setTimeout(() => {
+            if (!ffmpeg.killed) {
+              ffmpeg.kill('SIGKILL');
+            }
+          }, 500);
+        } catch (err) {
+          // Ignore kill errors
+        }
+        
+        reject(new Error(
+          `Recording timeout after ${durationSeconds + 2} seconds. ` +
+          'FFmpeg process did not exit in time. ' +
+          (stderrOutput ? `Last output: ${stderrOutput.slice(-200)}` : '')
+        ));
       }
-    }, durationSeconds * 1000);
+    }, (durationSeconds + 2) * 1000);
   });
 }
 
@@ -91,6 +165,51 @@ export function waitForPushToTalk(): Promise<void> {
       process.stdin.setRawMode(false);
       process.stdin.pause();
       resolve();
+    });
+  });
+}
+
+/**
+ * Lists available audio input devices on Windows using FFmpeg.
+ * Useful for debugging microphone issues.
+ * 
+ * @returns Promise resolving to list of device names
+ */
+export async function listAudioDevices(): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-list_devices', 'true',
+      '-f', 'dshow',
+      '-i', 'dummy'
+    ], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    
+    let stderrOutput = '';
+    
+    ffmpeg.stderr?.on('data', (data: Buffer) => {
+      stderrOutput += data.toString();
+    });
+    
+    ffmpeg.on('close', (code: number) => {
+      // FFmpeg exits with non-zero code for -list_devices, that's expected
+      const devices: string[] = [];
+      const lines = stderrOutput.split('\n');
+      
+      for (const line of lines) {
+        // Look for lines like: "  "Microphone (Realtek Audio)""
+        const match = line.match(/"\s*"([^"]+)"\s*"/);
+        if (match) {
+          devices.push(match[1]);
+        }
+      }
+      
+      resolve(devices);
+    });
+    
+    ffmpeg.on('error', (err: Error) => {
+      reject(new Error(`Failed to list audio devices: ${err.message}`));
     });
   });
 }

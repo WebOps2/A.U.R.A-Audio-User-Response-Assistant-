@@ -1,18 +1,19 @@
-import { waitForPushToTalk, recordAudio } from '../voice/record.js';
-import { transcribe } from '../voice/transcribe.js';
-import { routeIntent, createPlan } from '../intents/router.js';
-import { getCommandForIntent } from '../intents/whitelist.js';
+import { existsSync } from 'fs';
+import { planAndExplain } from '../agent/agent.js';
 import { executeCommand } from '../exec/runner.js';
+import { createPlan, routeIntent } from '../intents/router.js';
+import { Intent } from '../intents/types.js';
+import { getCommandForIntent } from '../intents/whitelist.js';
+import { createMemory } from '../session/memory.js';
 import { summarize } from '../summarize/index.js';
 import { speak } from '../tts/elevenlabs.js';
-import { Intent } from '../intents/types.js';
-import { existsSync } from 'fs';
-import { join } from 'path';
+import { recordAudio, waitForPushToTalk } from '../voice/record.js';
+import { transcribe } from '../voice/transcribe.js';
 
 /**
  * Single-turn listen mode: record, transcribe, plan, confirm if needed, execute, summarize, speak.
  */
-export async function listenMode(repoPath: string, mute: boolean): Promise<void> {
+export async function listenMode(repoPath: string, mute: boolean, useAgent: boolean = false): Promise<void> {
   console.log('🎤 DevVoice - Single Turn Mode');
   console.log(`📁 Repository: ${repoPath}`);
   
@@ -36,14 +37,56 @@ export async function listenMode(repoPath: string, mute: boolean): Promise<void>
     const transcription = await transcribe(audioPath);
     console.log(`\n💬 Heard: "${transcription}"`);
     
-    // Step 4: Route intent
-    const intentResult = routeIntent(transcription);
-    const plan = createPlan(intentResult);
+    // Step 4: Plan using AI agent or fallback router
+    let intent: Intent;
+    let params: Record<string, string> | undefined;
+    let planDescription: string;
+    let requiresConfirmation = false;
+    const memory = createMemory(); // Empty memory for single-turn mode
     
-    console.log(`\n📋 Plan: ${plan.description}`);
+    if (useAgent && process.env.OPENAI_API_KEY) {
+      console.log('🤖 Using AI agent for planning...');
+      const agentResult = await planAndExplain(transcription, memory);
+      
+      // Handle low confidence with clarifying question
+      if (agentResult.confidence < 0.6 && agentResult.clarifyingQuestion) {
+        const questionText = `I'm not sure I understood. ${agentResult.clarifyingQuestion}`;
+        console.log(`\n❓ ${questionText}`);
+        if (!mute) {
+          await speak(questionText, mute);
+        }
+        return;
+      }
+      
+      intent = agentResult.intent;
+      params = agentResult.params;
+      planDescription = agentResult.planSteps.join(' → ');
+      
+      // Map intent to confirmation requirement
+      requiresConfirmation = intent === Intent.CREATE_BRANCH || intent === Intent.MAKE_COMMIT;
+      
+      // Use explanation if available (especially for EXPLAIN_FAILURE)
+      if (agentResult.explanation && intent === Intent.EXPLAIN_FAILURE) {
+        console.log(`\n💡 Explanation: ${agentResult.explanation}`);
+        if (!mute) {
+          await speak(agentResult.explanation, mute);
+        }
+        return;
+      }
+    } else {
+      // Fallback to simple router
+      const intentResult = routeIntent(transcription);
+      const plan = createPlan(intentResult);
+      intent = plan.intent;
+      params = plan.params;
+      planDescription = plan.description;
+      requiresConfirmation = plan.requiresConfirmation;
+    }
+    
+    console.log(`\n📋 Plan: ${planDescription}`);
     
     // Handle special intents that don't require execution
-    if (plan.intent === Intent.HELP) {
+    if (intent === Intent.HELP) {
       const helpText = getHelpText();
       console.log(helpText);
       if (!mute) {
@@ -52,7 +95,7 @@ export async function listenMode(repoPath: string, mute: boolean): Promise<void>
       return;
     }
     
-    if (plan.intent === Intent.UNKNOWN) {
+    if (intent === Intent.UNKNOWN) {
       const unknownText = `I didn't understand that. Try saying "help" for available commands.`;
       console.log(unknownText);
       if (!mute) {
@@ -62,14 +105,14 @@ export async function listenMode(repoPath: string, mute: boolean): Promise<void>
     }
     
     // Step 5: Get command
-    const commandTemplate = await getCommandForIntent(plan.intent, plan.params, repoPath);
+    const commandTemplate = await getCommandForIntent(intent, params, repoPath);
     
     if (!commandTemplate) {
       let errorText: string;
-      if (plan.intent === Intent.MAKE_COMMIT) {
+      if (intent === Intent.MAKE_COMMIT) {
         errorText = 'Cannot commit: no staged changes. Please stage files first using git add.';
       } else {
-        errorText = `Cannot execute ${plan.intent}. Command not available or parameters missing.`;
+        errorText = `Cannot execute ${intent}. Command not available or parameters missing.`;
       }
       console.log(`❌ ${errorText}`);
       if (!mute) {
@@ -79,7 +122,7 @@ export async function listenMode(repoPath: string, mute: boolean): Promise<void>
     }
     
     // Step 6: Confirm if needed
-    if (plan.requiresConfirmation) {
+    if (requiresConfirmation) {
       console.log('\n⚠️  This action requires confirmation.');
       await waitForPushToTalk();
       console.log('🔴 Recording confirmation...');
@@ -103,7 +146,7 @@ export async function listenMode(repoPath: string, mute: boolean): Promise<void>
     const result = await executeCommand(commandTemplate);
     
     // Step 8: Summarize
-    const summary = summarize(plan.intent, result);
+    const summary = summarize(intent, result);
     console.log(`\n📊 Summary: ${summary}`);
     
     // Step 9: Speak

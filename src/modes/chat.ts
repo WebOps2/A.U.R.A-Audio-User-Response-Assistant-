@@ -4,7 +4,7 @@ import { routeIntent, createPlan } from '../intents/router.js';
 import { getCommandForIntent } from '../intents/whitelist.js';
 import { executeCommand } from '../exec/runner.js';
 import { summarize } from '../summarize/index.js';
-import { speak } from '../tts/elevenlabs.js';
+import { speak, playAudioFile } from '../voice/tts.js';
 import { createMemory, updateMemory, explainFailure, getDetails } from '../session/memory.js';
 import { Intent } from '../intents/types.js';
 import { planAndExplain } from '../agent/agent.js';
@@ -16,10 +16,19 @@ import { existsSync } from 'fs';
 async function safeSpeak(text: string, mute: boolean): Promise<void> {
   if (mute) return;
   try {
-    await speak(text, mute);
+    const audioPath = await speak(text);
+    if (!mute) {
+      await playAudioFile(audioPath);
+    } else {
+      console.log(`🔇 Muted: Audio saved to ${audioPath}`);
+    }
   } catch (error) {
     // Log but don't throw - we want the chat loop to continue
-    console.error('⚠️  Failed to speak:', error instanceof Error ? error.message : error);
+    if (error instanceof Error && error.message.includes('ELEVENLABS_API_KEY')) {
+      console.warn('⚠️  ELEVENLABS_API_KEY not set. Skipping TTS.');
+    } else {
+      console.error('⚠️  Failed to speak:', error instanceof Error ? error.message : error);
+    }
   }
 }
 
@@ -51,8 +60,17 @@ export async function chatMode(repoPath: string, mute: boolean, useAgent: boolea
       
       // Step 3: Transcribe
       console.log('📝 Transcribing...');
-      const transcription = await transcribe(audioPath);
-      console.log(`\n💬 Heard: "${transcription}"`);
+      let transcription: string;
+      try {
+        transcription = await transcribe(audioPath);
+        console.log(`\n💬 Heard: "${transcription}"`);
+      } catch (error) {
+        console.error('❌ Transcription failed:', error instanceof Error ? error.message : error);
+        if (error instanceof Error && error.message.includes('ELEVENLABS_API_KEY')) {
+          console.log('⚠️  Continuing chat loop...');
+        }
+        continue;
+      }
       
       // Step 4: Plan using AI agent or fallback router
       let intent: Intent;

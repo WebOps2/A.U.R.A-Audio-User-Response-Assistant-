@@ -1,8 +1,8 @@
-import { createWriteStream } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
-import * as recorder from 'node-record-lpcm16';
+import { createWriteStream } from 'fs';
+import * as recorder from "node-record-lpcm16";
+import { tmpdir } from 'os';
+import { join } from 'path';
 // WAV package uses CommonJS, so we need to use createRequire for ES modules
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -44,20 +44,35 @@ export async function recordAudio(options: RecordingOptions = {}): Promise<strin
 
     recording.stream().pipe(writer);
 
+    // Track if promise is already settled to prevent double resolution
+    let settled = false;
+
+    // Attach close listener immediately (before error handler) to handle early errors
+    fileStream.on('close', () => {
+      if (!settled) {
+        settled = true;
+        resolve(outputPath);
+      }
+    });
+
+    // Error handler - reject immediately and clean up
+    recording.stream().on('error', (err: Error) => {
+      if (!settled) {
+        settled = true;
+        recording.stop();
+        writer.end();
+        reject(err);
+      }
+    });
+
     // Stop recording after duration
     setTimeout(() => {
-      recording.stop();
-      writer.end();
-      fileStream.on('close', () => {
-        resolve(outputPath);
-      });
+      if (!settled) {
+        recording.stop();
+        writer.end();
+        // Close listener will handle resolution
+      }
     }, durationSeconds * 1000);
-
-    recording.stream().on('error', (err) => {
-      recording.stop();
-      writer.end();
-      reject(err);
-    });
   });
 }
 

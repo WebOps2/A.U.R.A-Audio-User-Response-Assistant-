@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import 'dotenv/config';
 import { Command } from 'commander';
 import { chatMode } from './modes/chat.js';
 import { listenMode } from './modes/listen.js';

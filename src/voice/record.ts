@@ -24,6 +24,31 @@ export async function recordAudio(options: RecordingOptions = {}): Promise<strin
   // Ensure output directory exists
   await mkdir(dirname(outputPath), { recursive: true });
   
+  // On Windows, get the microphone device name
+  let micName: string | undefined;
+  if (process.platform === 'win32') {
+    if (process.env.DEVVOICE_MIC) {
+      micName = process.env.DEVVOICE_MIC;
+    } else {
+      // Try to list available devices and use the first one
+      try {
+        const devices = await listAudioDevices();
+        if (devices.length > 0) {
+          micName = devices[0];
+        }
+      } catch (error) {
+        // If listing fails, we'll throw an error below
+      }
+    }
+    
+    if (!micName) {
+      throw new Error(
+        'No microphone device found. Please set DEVVOICE_MIC environment variable with your microphone name, ' +
+        'or ensure a microphone is connected and accessible.'
+      );
+    }
+  }
+  
   return new Promise((resolve, reject) => {
     // Track if promise is already settled to prevent double resolution
     let settled = false;
@@ -33,11 +58,6 @@ export async function recordAudio(options: RecordingOptions = {}): Promise<strin
     const args: string[] = [];
     
     if (process.platform === 'win32') {
-      // Windows: Use DirectShow
-      // Allow microphone name to be overridden via env var
-      const micName = process.env.DEVVOICE_MIC || 
-        'Microphone Array (Intel® Smart Sound Technology for Digital Microphones)';
-      
       args.push(
         '-hide_banner',                // Reduce noise
         '-loglevel', 'error',          // Only show errors
@@ -110,6 +130,9 @@ export async function recordAudio(options: RecordingOptions = {}): Promise<strin
       
       if (!settled) {
         settled = true;
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/1db3fe2d-876b-4f73-9bfa-da58800c7558',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'record.ts:104',message:'FFmpeg process closed',data:{exitCode:code,stderrFull:stderrOutput},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
         if (code === 0) {
           // Success - FFmpeg completed normally
           resolve(outputPath);
@@ -198,8 +221,9 @@ export async function listAudioDevices(): Promise<string[]> {
       const lines = stderrOutput.split('\n');
       
       for (const line of lines) {
-        // Look for lines like: "  "Microphone (Realtek Audio)""
-        const match = line.match(/"\s*"([^"]+)"\s*"/);
+        // Look for lines like: [dshow @ ...] "Device Name" (audio)
+        // Match pattern: "Device Name" followed by (audio)
+        const match = line.match(/"([^"]+)"\s*\(audio\)/);
         if (match) {
           devices.push(match[1]);
         }
